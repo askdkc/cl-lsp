@@ -1,0 +1,75 @@
+#!/bin/sh
+#|-*- mode:lisp -*-|#
+#|
+exec ros -Q -- "$0" "$@"
+|#
+(ros:ensure-asdf)
+(sb-ext:disable-debugger)
+(defpackage :cl-lsp/roswell-tests (:use :cl))
+(in-package :cl-lsp/roswell-tests)
+(defparameter *repository*
+  (uiop:pathname-parent-directory-pathname
+   (uiop:pathname-directory-pathname *load-truename*)))
+(defun main (&rest args)
+  (declare (ignore args))
+  (let* ((root (uiop:ensure-directory-pathname
+                (string-trim '(#\Newline #\Return)
+                             (uiop:run-program '("mktemp" "-d" "/tmp/cl-lsp-roswell.XXXXXX") :output :string))))
+         (project (merge-pathnames "project/" root))
+         (cache (uiop:getenv "XDG_CACHE_HOME")))
+    (unwind-protect
+         (progn
+           (setf (uiop:getenv "XDG_CACHE_HOME") (namestring (merge-pathnames "cache/" root)))
+           (asdf:clear-output-translations)
+           (dolist (file '("cl-lsp.asd" "main.lisp" "scripts/installer.lisp" "roswell/cl-lsp.ros"))
+             (uiop:copy-file (merge-pathnames file *repository*)
+                             (ensure-directories-exist (merge-pathnames file project))))
+           ;; Exercise the real Roswell installation routine, replacing only
+           ;; network/native dependency construction with a small executable.
+           (with-open-file (out (merge-pathnames "scripts/installer.lisp" project)
+                                :direction :output :if-exists :append)
+             (write-string "
+(defun install (prefix &key tls-only)
+  (declare (ignore tls-only))
+  (when (equal (uiop:getenv \"CL_LSP_TEST_FAIL\") \"1\") (error \"Simulated dependency failure\"))
+  (ensure-directories-exist prefix)
+  (let ((launcher (merge-pathnames \"cl-lsp\" prefix)))
+    (write-new launcher \"#!/bin/sh
+printf 'ARG:%s
+' \\\"$@\\\"
+\")
+    (run (list \"chmod\" \"755\" (namestring launcher)))))
+" out))
+           (roswell:include "util-install-quicklisp")
+           (let* ((checkout-symbol (find-symbol "CHECKOUTDIR" "ROSWELL.UTIL"))
+                  (original (symbol-function checkout-symbol)))
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function checkout-symbol) (lambda () root))
+                    (asdf:initialize-source-registry
+                     `(:source-registry (:directory ,project) :inherit-configuration))
+                    (asdf:load-asd (merge-pathnames "cl-lsp.asd" project))
+                    (uiop:symbol-call :roswell.install :install-system-script "cl-lsp")
+                    (let* ((pointer (merge-pathnames "bin/cl-lsp-runtime.sexp" root))
+                           (before (uiop:read-file-string pointer))
+                           (launcher (namestring (merge-pathnames "bin/cl-lsp" root))))
+                      (assert (probe-file launcher))
+                      (let ((output (uiop:run-program (list launcher "--stdio" "a b") :output :string)))
+                        (assert (equal output (format nil "ARG:--stdio~%ARG:a b~%")) () "Unexpected launcher output: ~S" output))
+                      (setf (uiop:getenv "CL_LSP_TEST_FAIL") "1")
+                      (assert (handler-case
+                                  (progn (uiop:symbol-call :roswell.install :install-system-script "cl-lsp") nil)
+                                (error () t)))
+                      (assert (equal before (uiop:read-file-string pointer)))
+                      (setf (uiop:getenv "CL_LSP_TEST_FAIL") "")
+                      (uiop:symbol-call :roswell.install :install-system-script "cl-lsp")
+                      (assert (not (equal before (uiop:read-file-string pointer))))
+                      ;; Outside Roswell's installation phase this must remain
+                      ;; the real server system, not the bootstrap definition.
+                      (asdf:load-asd (merge-pathnames "cl-lsp.asd" project))
+                      (assert (equal '("lem-language-server/cli")
+                                     (asdf:system-depends-on (asdf:find-system "cl-lsp"))))
+                      (format t "Roswell build hook, copied launcher, argument forwarding, reinstall and failed-install preservation passed.~%")))
+               (setf (symbol-function checkout-symbol) original))))
+      (setf (uiop:getenv "XDG_CACHE_HOME") (or cache "")
+            (uiop:getenv "CL_LSP_TEST_FAIL") ""))))

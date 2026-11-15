@@ -1,7 +1,7 @@
 (require :asdf)
 (defpackage :cl-lsp/installer
   (:use :cl)
-  (:export :command :install :select-openssl :compatible-p :tls-source :run-ros))
+  (:export :command :install :install-for-roswell :select-openssl :compatible-p :tls-source :run-ros))
 (in-package :cl-lsp/installer)
 
 (defparameter *root*
@@ -163,6 +163,27 @@ git lem-extension-manager https://github.com/lem-project/lem-extension-manager.g
                  (format t "Launcher: ~A~%" launcher)))))
       (setf (uiop:getenv "XDG_CACHE_HOME") (or old-cache "")
             (uiop:getenv "CL_SOURCE_REGISTRY") (or old-registry "")))))
+
+(defun install-for-roswell ()
+  ;; Keep failed attempts for diagnosis and retain the previous working pointer
+  ;; until the new runtime has passed its load check.
+  (let* ((prefix (loop for name = (format nil ".cl-lsp/install-~D-~D/"
+                                         (get-universal-time) (random 1000000000))
+                       for path = (merge-pathnames name *root*)
+                       unless (probe-file path) return path))
+         (bin (merge-pathnames "bin/" (uiop:symbol-call :roswell.util :checkoutdir)))
+         (pointer (merge-pathnames "cl-lsp-runtime.sexp" bin))
+         (temporary (merge-pathnames (format nil "cl-lsp-runtime-~D.tmp" (random 1000000000)) bin)))
+    (install prefix)
+    (unless (probe-file (merge-pathnames "cl-lsp" prefix))
+      (error "Installation did not produce a CL-LSP launcher: ~A" prefix))
+    (ensure-directories-exist bin)
+    (unwind-protect
+         (progn
+           (write-new temporary
+                      (format nil "~S~%" (namestring (merge-pathnames "cl-lsp" prefix))))
+           (uiop:rename-file-overwriting-target temporary pointer))
+      (when (probe-file temporary) (delete-file temporary)))))
 
 (defun command (args)
   (when (member "--help" args :test #'equal)

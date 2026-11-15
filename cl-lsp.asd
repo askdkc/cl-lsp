@@ -1,6 +1,14 @@
+;; Roswell loads the system before invoking its build hook. Defer the server
+;; dependencies until the hook has installed them in their own environment.
+#+ros.installing
+(let ((root (uiop:pathname-directory-pathname *load-truename*)))
+  (load (merge-pathnames "scripts/installer.lisp" root))
+  (setf (symbol-value (find-symbol "*BUILD-HOOK*" "ROSWELL.INSTALL"))
+        (lambda () (uiop:symbol-call :cl-lsp/installer :install-for-roswell))))
+
 (defsystem "cl-lsp"
-  :depends-on ("lem-language-server/cli")
-  :components ((:file "main"))
+  :depends-on (#-ros.installing "lem-language-server/cli")
+  :components (#-ros.installing (:file "main"))
   :in-order-to ((test-op (test-op "cl-lsp/test"))))
 
 (defsystem "cl-lsp/executable"

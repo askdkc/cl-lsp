@@ -45,6 +45,20 @@ not target the GUI editor. The proposed reduced manifest still needs a cold
 installation test with network access; this is not proof of a functioning
 minimal installation against a future upstream Git head.
 
+## Single-command Roswell installation
+
+The fork now registers Roswell's build hook from `cl-lsp.asd`. Only during
+`:ros.installing`, server loading is deferred until the hook prepares the
+dependencies. A sidecar in Roswell's bin directory selects the completed runtime;
+the normal installed `cl-lsp` script forwards arguments to it.
+
+`ros tests/roswell-install.ros` exercises Roswell's actual
+`install-system-script` routine against an isolated checkout and bin directory.
+Dependency construction is replaced with a test executable. Hook invocation,
+script copying, argument forwarding (including spaces), successful reinstall,
+preservation after a failed reinstall, and normal ASDF dependencies are checked.
+This does not establish remote GitHub download or real LSP startup success.
+
 No global Roswell launcher, MoDKH installation, Homebrew link, or existing
-Lem checkout was changed. The original `ros install` command is not patched;
-use the new installer for this configuration path.
+Lem checkout was changed during verification. Full remote installation remains
+unverified because GitHub DNS resolution failed in this environment.

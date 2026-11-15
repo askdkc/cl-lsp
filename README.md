@@ -4,30 +4,21 @@ It includes a Roswell installer for the language server without the Lem editor, 
 
 ## Getting Started
 
-1. Get CL-LSP Installed
+With [Roswell](https://github.com/roswell/roswell/), SBCL and Quicklisp set up:
 
-    1. Install [roswell](https://github.com/roswell/roswell/)
+```sh
+ros install askdkc/cl-lsp
+```
 
-    2. Clone **this fork** and install the language-server dependencies into a
-       **new** directory (Git, Make, Autoconf, Automake and Libtool are
-       also required):
+The installation hook fetches the language-server dependencies, builds the native
+library and configures compatible OpenSSL on macOS. Git, Make, Autoconf, Automake
+and Libtool are required. Lem's editor is not installed.
 
-       ```sh
-       git clone https://github.com/askdkc/cl-lsp.git
-       cd cl-lsp
-       ros scripts/install-headless.ros --prefix "$HOME/.local/share/cl-lsp"
-       ```
+Configure your editor to run `~/.roswell/bin/cl-lsp --stdio`.
+Use `~/.roswell/bin/cl-lsp --help` to check loading.
 
-       Roswell must already have a working SBCL and Quicklisp setup. The installer
-       fetches current Git heads; it does not pin a Lem or OpenSSL version. A failed
-       attempt is retained for inspection. Retry with a new prefix.
-
-    3. Verify loading: `~/.local/share/cl-lsp/cl-lsp --help`.
-       Configure your editor to launch this executable with `--stdio`.
-
-2. Configure your editor to use CL-LSP. See below for more information about editor integration.
-
-3. Enjoy!
+Reinstallation builds a new runtime before switching the launcher; a failed build
+keeps the previous runtime selected. Dependency versions are not hard-coded.
 
 ### macOS: `ASN1_STRING_data` is undefined
 
@@ -46,8 +37,8 @@ To check this part independently, without downloading Lem:
 ros scripts/install-headless.ros --prefix /tmp/cl-lsp-tls-check-new --tls-only
 ```
 
-Use the installer from this fork's checkout. `ros install askdkc/cl-lsp` alone
-does not run this dependency and OpenSSL setup.
+The standalone script is available for diagnostics or a custom installation
+prefix; normal installation only requires `ros install askdkc/cl-lsp`.
 
 ### `Component :TRIVIAL-GRAY-STREAMS not found`
 
@@ -79,6 +70,7 @@ Installer checks (the real CL+SSL test requires macOS and Roswell):
 
 ```sh
 ros tests/install-headless.ros
+ros tests/roswell-install.ros
 ```
 
 # Visual Studio Code
