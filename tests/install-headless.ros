@@ -1,0 +1,110 @@
+#!/bin/sh
+#|-*- mode:lisp -*-|#
+#|
+exec ros -Q -- "$0" "$@"
+|#
+(ros:ensure-asdf)
+#+sbcl (sb-ext:disable-debugger)
+(load (merge-pathnames "../scripts/installer.lisp" *load-truename*))
+(defpackage :cl-lsp/install-tests (:use :cl))
+(in-package :cl-lsp/install-tests)
+
+(defun signals-error-p (function)
+  (handler-case (progn (funcall function) nil) (error () t)))
+
+(defun test-missing-dependency (root configuration)
+  ;; Isolate ASDF from installed systems. This provider models Quicklisp's
+  ;; dependency acquisition; the separate macOS test exercises real CL+SSL.
+  (let* ((fixture (merge-pathnames "dependency-fixture/" root))
+         (script (merge-pathnames "test.lisp" fixture))
+         (dependency (merge-pathnames "trivial-gray-streams.asd" fixture))
+         (line "(mapc #'ensure-dependency (asdf:system-depends-on (asdf:find-system \"cl+ssl\")))")
+         (position (search line configuration)))
+    (assert position)
+    (ensure-directories-exist fixture)
+    (cl-lsp/installer::write-new (merge-pathnames "cl+ssl.asd" fixture)
+                                "(asdf:defsystem \"cl+ssl\" :depends-on (\"trivial-gray-streams\"))")
+    (let ((bootstrap
+            (format nil "(require :asdf)
+(asdf:initialize-source-registry '(:source-registry (:directory ~S) :ignore-inherited-configuration))
+(defpackage :cl+ssl/config (:use :cl) (:export :define-libcrypto-path :define-libssl-path))
+(defmacro cl+ssl/config:define-libcrypto-path (p) (declare (ignore p)) nil)
+(defmacro cl+ssl/config:define-libssl-path (p) (declare (ignore p)) nil)
+(defpackage :cffi (:use :cl) (:export :foreign-funcall :null-pointer-p))
+(defmacro cffi:foreign-funcall (&rest args) (declare (ignore args)) 1)
+(defun cffi:null-pointer-p (p) (declare (ignore p)) nil)
+(defpackage :ql (:use :cl) (:export :quickload))
+(defun ql:quickload (name &key silent)
+  (declare (ignore silent))
+  (when (equal name \"trivial-gray-streams\")
+    (with-open-file (out ~S :direction :output :if-exists :supersede)
+      (write '(asdf:defsystem \"trivial-gray-streams\") :stream out))
+    (asdf:load-asd ~S)))~%"
+                    (namestring fixture) (namestring dependency) (namestring dependency))))
+      (labels ((execute (source)
+                 (with-open-file (out script :direction :output :if-exists :supersede)
+                   (write-string bootstrap out)
+                   (write-string source out))
+                 (uiop:run-program
+                  (list "sbcl" "--noinform" "--no-sysinit" "--no-userinit"
+                        "--disable-debugger" "--script" (namestring script))
+                  :output :string :error-output :string :ignore-error-status t)))
+        (multiple-value-bind (output errors status)
+            (execute (concatenate 'string (subseq configuration 0 position) "(values)"
+                                  (subseq configuration (+ position (length line)))))
+          (declare (ignore output))
+          (assert (not (zerop status)))
+          (assert (search "TRIVIAL-GRAY-STREAMS" (string-upcase errors))))
+        (multiple-value-bind (output errors status) (execute configuration)
+          (assert (zerop status) () "Fixed dependency load failed: ~A" errors)
+          (assert (equal "" output)))
+        (format t "Missing dependency: pre-fix failed; fixed configuration passed.~%")))))
+
+(defun main (&rest args)
+  (declare (ignore args))
+  (let* ((root (uiop:ensure-directory-pathname
+                (string-trim '(#\Newline #\Return)
+                             (uiop:run-program '("mktemp" "-d" "/tmp/cl-lsp-tests.XXXXXX") :output :string))))
+         (cache (uiop:getenv "XDG_CACHE_HOME")))
+    (unwind-protect
+         (progn
+           (setf (uiop:getenv "XDG_CACHE_HOME") (namestring (merge-pathnames "cache/" root)))
+           (assert (signals-error-p (lambda () (cl-lsp/installer:select-openssl (list root)))))
+           (let ((sentinel (merge-pathnames "sentinel" root)))
+             (with-open-file (out sentinel :direction :output) (write-string "keep" out))
+             (assert (signals-error-p (lambda () (cl-lsp/installer:install root :tls-only t))))
+             (assert (equal "keep" (uiop:read-file-string sentinel))))
+           (let ((value "a 'quoted' path; $(false)"))
+             (assert (equal value
+                            (uiop:run-program
+                             (list "sh" "-c" (format nil "printf %s ~A" (cl-lsp/installer::shell-quote value)))
+                             :output :string))))
+           #+darwin
+           (let* ((library (cl-lsp/installer:select-openssl))
+                  (config (merge-pathnames "configure-tls.lisp" root)))
+             (test-missing-dependency root (cl-lsp/installer:tls-source library))
+             (with-open-file (out config :direction :output)
+               (write-string (cl-lsp/installer:tls-source library) out))
+             (assert (equal '("TLS_OK")
+                            (remove "" (uiop:split-string
+                                        (cl-lsp/installer:run-ros
+                                         (list "-l" (namestring config) "-e" "(write-line \"TLS_OK\")" "-q")
+                                         :capture t)
+                                        :separator '(#\Newline #\Return)) :test #'equal)))
+             (let ((default (find-if #'probe-file '(#P"/opt/homebrew/opt/openssl/lib/"
+                                                    #P"/usr/local/opt/openssl/lib/"))))
+               (when (and default (not (cl-lsp/installer:compatible-p default)))
+                 (multiple-value-bind (output errors status)
+                     (uiop:run-program
+                      '("ros" "-Q" "-e" "(sb-ext:disable-debugger)"
+                        "-e" "(ql:quickload \"cl+ssl\" :silent t)"
+                        "-e" "(let ((value (cffi:foreign-funcall \"ASN1_STRING_new\" :pointer))) (unwind-protect (cffi:foreign-funcall \"ASN1_STRING_data\" :pointer value :pointer) (cffi:foreign-funcall \"ASN1_STRING_free\" :pointer value :void)))" "-q")
+                      :output :string :error-output :string :ignore-error-status t)
+                   (declare (ignore output))
+                   (assert (not (zerop status)))
+                   (assert (search "ASN1_STRING_data" errors))
+                   (assert (search "undefined" errors))
+                   (format t "Unconfigured OpenSSL regression reproduced.~%")))))
+           #-darwin (format t "macOS TLS checks skipped on this platform.~%")
+           (format t "Installer checks passed.~%"))
+      (setf (uiop:getenv "XDG_CACHE_HOME") (or cache "")))))

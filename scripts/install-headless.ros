@@ -1,0 +1,16 @@
+#!/bin/sh
+#|-*- mode:lisp -*-|#
+#|
+exec ros -Q -- "$0" "$@"
+|#
+(ros:ensure-asdf)
+#+sbcl (sb-ext:disable-debugger)
+(load (merge-pathnames "installer.lisp" *load-truename*))
+(defpackage :cl-lsp/install-command (:use :cl))
+(in-package :cl-lsp/install-command)
+(defun main (&rest args)
+  (handler-case
+      (cl-lsp/installer:command args)
+    (error (condition)
+      (format *error-output* "~A~%" condition)
+      (uiop:quit 1))))
