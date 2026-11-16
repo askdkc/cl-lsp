@@ -14,6 +14,15 @@ ros install askdkc/cl-lsp
 Configure your editor to run `~/.roswell/bin/cl-lsp --stdio`.
 Check loading with `~/.roswell/bin/cl-lsp --help`.
 
+If reinstalling still loads the old Lem or reports `System "deploy" not found`,
+update Roswell's cached checkout first; `ros install` does not pull an existing
+Git checkout:
+
+```sh
+git -C ~/.roswell/local-projects/askdkc/cl-lsp pull --ff-only
+ros install askdkc/cl-lsp
+```
+
 No separate Lem installation, Qlot or OpenSSL setup is needed.
 Dependencies come from `vendor/`; installation does not download additional
 Lisp packages. Failed builds preserve the previously selected launcher.

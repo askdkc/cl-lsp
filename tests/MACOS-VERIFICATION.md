@@ -2,6 +2,12 @@
 
 Checked against the trimmed working tree on Darwin arm64 with Roswell/SBCL.
 
+- `ros tests/roswell-checkout.ros`: passed. Exercises Roswell's top-level
+  `install` and real `clone-github` against a disposable existing checkout.
+  Without `project.lisp`, it reproduces fallback to `cl-lsp`; after updating
+  the selector, the same path selects `cl-lsp-bootstrap`. Network probing,
+  system building and global registration/setup are stubbed. This test does
+  not perform a network Git pull.
 - `ros tests/bundled-dependencies.ros`: passed; 56 source systems resolve
   inside the checkout (plus SBCL's own modules). Checks source-file existence
   and rejects external Lem, deploy, Dexador, CL+SSL and Mustache.

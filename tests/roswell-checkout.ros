@@ -1,0 +1,68 @@
+#!/bin/sh
+#|-*- mode:lisp -*-|#
+#|
+exec ros -Q -- "$0" "$@"
+|#
+(ros:ensure-asdf)
+(sb-ext:disable-debugger)
+(ros:include "util-install")
+(defparameter *repository*
+  (uiop:pathname-parent-directory-pathname
+   (uiop:pathname-directory-pathname *load-truename*)))
+
+(defun main (&rest args)
+  (declare (ignore args))
+  (let* ((root (uiop:ensure-directory-pathname
+                (string-trim '(#\Newline)
+                             (uiop:run-program '("mktemp" "-d" "/tmp/cl-lsp-checkout.XXXXXX")
+                                               :output :string))))
+         (checkout (merge-pathnames "local-projects/askdkc/cl-lsp/" root))
+         (selected nil)
+         (saved nil)
+         (old-env (uiop:getenv "ROSINSTALL"))
+         (checkout-symbol (find-symbol "*CHECKOUT-DEFAULT*" "ROSWELL.INSTALL"))
+         (old-checkout (symbol-value checkout-symbol)))
+    (ensure-directories-exist checkout)
+    (labels ((replace-function (package name function)
+               (let ((symbol (find-symbol name package)))
+                 (push (cons symbol (symbol-function symbol)) saved)
+                 (setf (symbol-function symbol) function)))
+             (run-install ()
+               (setf selected nil (uiop:getenv "ROSINSTALL") "")
+               (roswell.install:install '("askdkc/cl-lsp"))
+               (reverse selected)))
+      (unwind-protect
+           (progn
+             (replace-function "ROSWELL.UTIL" "CHECKOUTDIR" (lambda () root))
+             ;; Isolate unrelated implementation discovery, global index updates
+             ;; and final ros setup. The real INSTALL and CLONE-GITHUB run below.
+             (replace-function "ROSWELL.UTIL" "READ-CALL"
+                               (lambda (&rest args) (declare (ignore args)) nil))
+             (dolist (name '("INSTALL-IMPL-IF-PROBED" "INSTALL-SCRIPT-IF-PROBED"
+                            "INSTALL-LOCALPATH-IF-PROBED"))
+               (replace-function "ROSWELL.INSTALL" name
+                                 (lambda (&rest args) (declare (ignore args)) nil)))
+             (replace-function "ROSWELL.INSTALL" "INSTALL-SYSTEM-IF-PROBED"
+                               (lambda (name)
+                                 (push name selected)
+                                 (member name '("cl-lsp" "cl-lsp-bootstrap") :test #'equal)))
+             (replace-function "ROSWELL" "EXEC"
+                               (lambda (&rest args) (declare (ignore args)) nil))
+             (setf (symbol-value checkout-symbol)
+                   (list (lambda (owner repository tag)
+                           (roswell.util:clone-github owner repository :branch tag
+                                                      :path "local-projects"
+                                                      :home root :force-git t)
+                           t)))
+             ;; Existing checkout is not refreshed, so Roswell falls back.
+             (assert (equal '("askdkc/cl-lsp" "cl-lsp") (run-install)))
+             (assert (not (probe-file (merge-pathnames "project.lisp" checkout))))
+             ;; Model the checkout after an explicit update, then repeat the
+             ;; same top-level install entry point (not install-system-script).
+             (uiop:copy-file (merge-pathnames "project.lisp" *repository*)
+                             (merge-pathnames "project.lisp" checkout))
+             (assert (equal '("askdkc/cl-lsp" "cl-lsp-bootstrap") (run-install)))
+             (format t "Cached checkout fallback reproduced; updated checkout selects bootstrap.~%"))
+        (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry)))
+        (setf (symbol-value checkout-symbol) old-checkout
+              (uiop:getenv "ROSINSTALL") (or old-env ""))))))
