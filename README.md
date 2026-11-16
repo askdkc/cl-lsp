@@ -30,6 +30,14 @@ Lisp packages. Failed builds preserve the previously selected launcher.
 See [bundled sources and licenses](vendor/SOURCES.md) and
 [verification](tests/MACOS-VERIFICATION.md).
 
+### Arch Linux
+
+```sh
+sudo pacman -Syu --needed roswell sbcl base-devel git
+ros install askdkc/cl-lsp
+~/.roswell/bin/cl-lsp --help
+```
+
 # Visual Studio Code
 
 Depends `CL-LSP` on [vscode-lisp](https://github.com/mattn/vscode-lisp). See [vscode](vscode) for more information about Visual Studio Code integration.
