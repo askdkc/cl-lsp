@@ -1,0 +1,147 @@
+(in-package :lem-core)
+
+(defclass cursor (point)
+  ((saved-column :initform nil
+                 :accessor cursor-saved-column)
+   (yank-start :initform nil
+               :accessor cursor-yank-start)
+   (yank-end :initform nil
+             :accessor cursor-yank-end)))
+
+(defmethod make-buffer-point (point)
+  (let ((cursor (make-instance 'cursor)))
+    (copy-point-using-class cursor point :left-inserting)))
+
+(defun push-buffer-point (point)
+  (let ((pt (copy-point point :right-inserting)))
+    (lem/common/ring:ring-push (buffer-points-ring (point-buffer pt)) pt))
+  point)
+
+(defun pop-buffer-point ()
+  (let ((ring (buffer-points-ring (current-buffer))))
+    (if (lem/common/ring:ring-empty-p ring)
+        (editor-error "No mark set in this buffer")
+        (prog1 (lem/common/ring:ring-ref ring 0)
+          (unless (lem/common/ring::ring-empty-p ring)
+            (loop :do (setf (lem/common/ring::ring-rear ring)
+                            (mod (1- (lem/common/ring::ring-rear ring))
+                                 (lem/common/ring::ring-size ring)))
+                  :until (pointp (aref (lem/common/ring::ring-data ring)
+                                       (mod (1- (lem/common/ring::ring-rear ring))
+                                            (lem/common/ring::ring-size ring)))))
+            (loop :do (setf (lem/common/ring::ring-front ring)
+                            (mod (1- (lem/common/ring::ring-front ring))
+                                 (lem/common/ring::ring-size ring)))
+                  :until (pointp (aref (lem/common/ring::ring-data ring)
+                                       (lem/common/ring::ring-front ring)))))))))
+
+(defmethod change-yank-start (cursor point)
+  (when (cursor-yank-start cursor)
+    (delete-point (cursor-yank-start cursor)))
+  (setf (cursor-yank-start cursor) point))
+
+(defmethod change-yank-end (cursor point)
+  (when (cursor-yank-end cursor)
+    (delete-point (cursor-yank-end cursor)))
+  (setf (cursor-yank-end cursor) point))
+
+(defclass fake-cursor (cursor)
+  ((killring :initarg :killring
+             :reader fake-cursor-killring)
+   (mark :initarg :mark
+         :initform (make-instance 'mark)
+         :reader fake-cursor-mark)))
+
+(defun fake-cursor-p (point)
+  "Return true if POINT is a fake cursor, i.e. a command is running for one
+of the extra cursors rather than the real one."
+  (typep point 'fake-cursor))
+
+(defmethod cursor-mark ((cursor cursor))
+  (buffer-mark-object (point-buffer cursor)))
+
+(defmethod cursor-mark ((cursor fake-cursor))
+  (fake-cursor-mark cursor))
+
+(defmethod set-cursor-mark ((cursor cursor) point)
+  (set-current-mark point)
+  (push-buffer-point point))
+
+(defmethod set-cursor-mark ((cursor fake-cursor) point)
+  (mark-set-point (fake-cursor-mark cursor) point))
+
+(defmethod pop-cursor-mark-point ((cursor cursor))
+  "Return the point that CURSOR's previous mark was set at.
+
+The real cursor pops the buffer's mark ring.  A fake cursor has only its own
+mark, so it returns that mark's point."
+  (pop-buffer-point))
+
+(defmethod pop-cursor-mark-point ((cursor fake-cursor))
+  (or (mark-point (fake-cursor-mark cursor))
+      (editor-error "No mark set for this cursor")))
+
+(defmethod cursor-region-beginning ((cursor cursor))
+  (point-min cursor (mark-point (cursor-mark cursor))))
+
+(defmethod cursor-region-end ((cursor cursor))
+  (point-max cursor (mark-point (cursor-mark cursor))))
+
+(defmethod cursor-killring ((cursor cursor))
+  (current-killring))
+
+(defmethod cursor-killring ((cursor fake-cursor))
+  (fake-cursor-killring cursor))
+
+(defun buffer-fake-cursors (buffer)
+  (buffer-value buffer 'fake-cursors))
+
+(defun (setf buffer-fake-cursors) (value buffer)
+  (setf (buffer-value buffer 'fake-cursors) value))
+
+(defun make-fake-cursor (point)
+  (let* ((killring (copy-killring (current-killring)))
+         (fake-cursor (make-instance 'fake-cursor :killring killring)))
+    (copy-point-using-class fake-cursor point :left-inserting)
+    (push fake-cursor (buffer-fake-cursors (point-buffer point)))
+    fake-cursor))
+
+(defun delete-fake-cursor (point)
+  (let ((buffer (point-buffer point)))
+    (assert (not (eq point (buffer-point buffer))))
+    ;; (assert (find point (buffer-fake-cursors buffer)))
+    (alexandria:deletef (buffer-fake-cursors buffer) point)
+    (delete-point point)
+    (alexandria:when-let ((yank-start (cursor-yank-start point)))
+      (delete-point yank-start))
+    (alexandria:when-let ((yank-end (cursor-yank-end point)))
+      (delete-point yank-end))
+    (values)))
+
+(defun clear-cursors (buffer)
+  (mapc #'delete-fake-cursor (buffer-fake-cursors buffer))
+  (values))
+
+(defun buffer-cursors (buffer)
+  (sort (copy-list (cons (buffer-point buffer)
+                         (buffer-fake-cursors buffer)))
+        #'point<))
+
+(defun merge-cursor-killrings (buffer)
+  (with-output-to-string (out)
+    (loop :for (cursor . not-lastp) :on (buffer-cursors buffer)
+          :do (let ((killring (cursor-killring cursor)))
+                (multiple-value-bind (string options)
+                    (peek-killring-item killring 0)
+                  (declare (ignore options))
+                  ;; TODO: consider options
+                  (when string
+                    (if not-lastp
+                        (write-line string out)
+                        (write-string string out))))))))
+
+(defmacro when-real-cursor (&body body)
+  "Execute BODY only if the current cursor is a real one (i.e. not a fake-cursor)."
+  `(unless (fake-cursor-p (current-point))
+     ,@body))
+

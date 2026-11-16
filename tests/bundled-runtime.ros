@@ -1,0 +1,74 @@
+#!/bin/sh
+#|-*- mode:lisp -*-|#
+#|
+exec ros -Q -- "$0" "$@"
+|#
+(ros:ensure-asdf)
+(sb-ext:disable-debugger)
+(defpackage :cl-lsp/runtime-tests (:use :cl))
+(in-package :cl-lsp/runtime-tests)
+(defparameter *repository*
+  (uiop:pathname-parent-directory-pathname
+   (uiop:pathname-directory-pathname *load-truename*)))
+
+(defun send-message (stream json)
+  ;; Test messages are ASCII, so characters and UTF-8 byte counts agree.
+  (format stream "Content-Length: ~D~C~C~C~C~A"
+          (length json) #\Return #\Newline #\Return #\Newline json)
+  (finish-output stream))
+
+(defun receive-message (stream)
+  (let ((length nil))
+    (loop for line = (string-right-trim '(#\Return) (read-line stream))
+          until (equal line "")
+          do (when (uiop:string-prefix-p "Content-Length: " line)
+               (setf length (parse-integer line :start 16))))
+    (assert length)
+    (let ((body (make-string length)))
+      (assert (= length (read-sequence body stream)))
+      body)))
+
+(defun check-protocol (launcher log)
+  (let ((process (uiop:launch-program (list launcher "--stdio")
+                                     :input :stream :output :stream
+                                     :error-output log :if-error-output-exists :supersede)))
+    (unwind-protect
+         (sb-ext:with-timeout 60
+           (let ((input (uiop:process-info-input process))
+                 (output (uiop:process-info-output process)))
+             (send-message input "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"processId\":null,\"rootUri\":null,\"capabilities\":{}}}")
+             (let ((response (receive-message output)))
+               (assert (search "\"capabilities\"" response) () "initialize failed: ~A" response))
+             (send-message input "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}")
+             (send-message input "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\"}")
+             (let ((response (receive-message output)))
+               (assert (search "\"result\"" response) () "shutdown failed: ~A" response))
+             (send-message input "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}")
+             (assert (zerop (uiop:wait-process process)))))
+      (when (uiop:process-alive-p process)
+        (uiop:terminate-process process :urgent t)
+        (uiop:wait-process process)))))
+
+(defun main (&rest args)
+  (let* ((root (uiop:ensure-directory-pathname
+                (string-trim '(#\Newline)
+                             (uiop:run-program '("mktemp" "-d" "/tmp/cl-lsp-real.XXXXXX")
+                                               :output :string))))
+         (install-only (member "--install-only" args :test #'equal))
+         (launcher (first (remove "--install-only" args :test #'equal))))
+    (unless launcher
+      (roswell:include "util-install-quicklisp")
+      (let* ((symbol (find-symbol "CHECKOUTDIR" "ROSWELL.UTIL"))
+             (original (symbol-function symbol)))
+        (unwind-protect
+             (progn
+               (setf (symbol-function symbol) (lambda () root))
+               (asdf:initialize-source-registry
+                `(:source-registry (:directory ,*repository*) :ignore-inherited-configuration))
+               ;; The real build hook, native compiler and bundled dependencies.
+               (uiop:symbol-call :roswell.install :install-system-script "cl-lsp-bootstrap")
+               (setf launcher (namestring (merge-pathnames "bin/cl-lsp" root))))
+          (setf (symbol-function symbol) original))))
+    (assert (search "--stdio" (uiop:run-program (list launcher "--help") :output :string)))
+(unless install-only (check-protocol launcher (merge-pathnames "stderr.log" root)))
+    (format t "~A passed: ~A~%" (if install-only "Installed launcher load" "LSP initialize, shutdown and exit") launcher)))

@@ -1,0 +1,281 @@
+(defpackage :lem/buffer/file-utils
+  (:use :cl)
+  (:export :expand-file-name
+           :tail-of-pathname
+           :directory-files
+           :list-directory
+           :file-size
+           :copy-file-or-directory
+           :virtual-probe-file
+           :with-open-virtual-file
+           ;; Virtual filesystem hooks
+           :*virtual-file-open*
+           :*virtual-probe-file-functions*
+           :*virtual-expand-file-name-functions*
+           :*virtual-directory-files-functions*
+           :*virtual-file-metadata-functions*
+           :*virtual-directory-exists-p-functions*
+           :virtual-directory-exists-p))
+(in-package :lem/buffer/file-utils)
+
+(defun guess-host-name (filename)
+  (declare (ignorable filename))
+  #+windows
+  (ppcre:register-groups-bind (host)
+      ("^(\\w:)" filename)
+    (pathname-host (parse-namestring host)))
+  #-windows
+  nil)
+
+(defun parse-filename (filename path)
+  (let* ((host (guess-host-name filename))
+         (start0 (if host 2 0))
+         (split-chars #+windows '(#\/ #\\) #-windows '(#\/)))
+    (flet ((split-char-p (c) (member c split-chars)))
+      (loop :for start := start0 :then (1+ pos)
+            :for pos := (position-if #'split-char-p filename :start start)
+            :unless pos
+            :do (return
+                  (if (= start (length filename))
+                      (make-pathname :directory path :host host)
+                      (let ((name (uiop:parse-native-namestring (subseq filename start))))
+                        (make-pathname :name (pathname-name name)
+                                       :type (pathname-type name)
+                                       :directory path
+                                       :host host))))
+            :while pos
+            :do (let ((name (subseq filename start pos)))
+                  (cond ((string= name "."))
+                        ((string= name "..")
+                         (setf path (butlast path)))
+                        ((string= name "~")
+                         (setf path (pathname-directory (truename "~/"))))
+                        ((string= name "")
+                         (setf path (list :absolute)))
+                        (t
+                         (setf path (append path (list name))))))))))
+
+;; FILENAME is a native path (pathname or unescaped string), the result is a lisp namestring.
+(defun expand-file-name (filename &optional (directory (uiop:getcwd)))
+  (when (pathnamep filename) (setf filename (uiop:native-namestring filename)))
+  (%call-virtual-handlers *virtual-expand-file-name-functions*
+      (list filename directory)
+    (lambda ()
+      (let ((pathname (parse-filename filename (pathname-directory directory))))
+        (namestring (merge-pathnames pathname directory))))))
+
+(defun tail-of-pathname (pathname)
+  (let ((pathname (uiop:ensure-absolute-pathname pathname #p"/")))
+    (enough-namestring
+     pathname
+     (if (uiop:directory-pathname-p pathname)
+         (uiop:pathname-parent-directory-pathname pathname)
+         (uiop:pathname-directory-pathname pathname)))))
+
+(defun probe-file% (x)
+  (let ((x2 (probe-file x)))
+    (when x2
+      (let* ((base "~/")
+             (mod (namestring (truename base)))
+             (len (length mod)))
+        (if (equal (ignore-errors (subseq (namestring x2) 0 len)) mod)
+            (make-pathname :defaults (format nil "~A~A" base (subseq (namestring x2) len)))
+            x2)))))
+
+(defun virtual-probe-file (pathspec &optional (base-dir pathspec))
+  (%call-virtual-handlers *virtual-probe-file-functions*
+      (list pathspec base-dir)
+    (lambda ()
+      (cond
+        ((ppcre:scan "^~/.*" (namestring base-dir)) (probe-file% pathspec))
+        (t (probe-file pathspec))))))
+
+(defun sort-files (pathnames &key (key #'namestring) (test #'string<))
+  "Sort a list of pathnames."
+  (sort (copy-list pathnames)
+        test :key key))
+
+(defun sort-files-with-method (files &key (sort-method :pathname) reverse)
+  "Sort files with a SORT-METHOD, one of :pathname (default), :mtime, :size and :extension.
+
+  For :pathname sort from A to Z, otherwise by descending order (biggest files first, most recent files first).
+
+  REVERSE: boolean."
+  (let ((sorted
+          (cond
+            ((eql sort-method :mtime)
+             (sort-files files :test #'> :key #'file-mtime))
+            ((eql sort-method :size)
+             (sort-files files :test #'> :key #'file-size))
+            ((eql sort-method :extension)
+             (sort-files files :test
+                         #+sbcl
+                         #'sb-unicode:unicode<
+                         #-sbcl
+                         #'string<
+                         :key (lambda (x)
+                                (or (pathname-type x) ""))))
+            (t
+             (let ((pathname-test
+                     ;; Correctly sort words starting with an uppercase letter or an accent.
+                     #+sbcl
+                     #'sb-unicode:unicode<
+                     ;; Uppercased words appear first, an accent is sorted last.
+                     #-sbcl
+                     #'string<))
+               (sort-files files :test pathname-test :key #'namestring))))))
+    (if reverse
+        (reverse sorted)
+        sorted)))
+
+(defun directory-files (pathspec)
+  (%call-virtual-handlers *virtual-directory-files-functions*
+      (list pathspec)
+    (lambda ()
+      (if (uiop:directory-pathname-p pathspec)
+          (list (pathname pathspec))
+          (or (mapcar (lambda (x) (virtual-probe-file x pathspec))
+                      (directory pathspec))
+              (list pathspec))))))
+
+(defun list-directory (directory &key directory-only (sort-method :pathname) sort-reverse)
+  (delete nil
+          (mapcar (lambda (x) (and (virtual-probe-file x directory) x))
+                  (append (sort-files-with-method
+                           (copy-list (uiop:subdirectories directory))
+                           :sort-method sort-method
+                           :reverse sort-reverse)
+                          (unless directory-only
+                            (sort-files-with-method (uiop:directory-files directory)
+                                                    :sort-method sort-method
+                                                    :reverse sort-reverse))))))
+
+(defun file-size (pathname)
+  (or (loop :for f :in *virtual-file-metadata-functions*
+            :for result := (funcall f pathname :size)
+            :when result :do (return result))
+      #+sbcl
+      (sb-posix:stat-size (sb-posix:stat pathname))
+      #+lispworks
+      (system:file-size pathname)
+      #+(and (not lispworks) win32)
+      (return-from file-size nil)
+      #-win32
+      (ignore-errors (with-open-file (in pathname) (file-length in)))))
+
+(defun file-mtime (pathname)
+  "Return the file's last data modification time."
+  (%call-virtual-handlers *virtual-file-metadata-functions*
+      (list pathname :mtime)
+    (lambda ()
+      #+sbcl (sb-posix:stat-mtime (sb-posix:stat pathname))
+      #-sbcl (error "file-utils: file-mtime is not implemented for your implementation."))))
+
+(defun copy-file-or-directory (from to)
+  (let ((base-dir from))
+    (labels ((rec (from to)
+               (cond ((uiop:directory-pathname-p from)
+                      (dolist (from-file (uiop:directory-files from))
+                        (rec from-file (merge-pathnames (enough-namestring from-file base-dir) to)))
+                      (dolist (from-dir (uiop:subdirectories from))
+                        (rec from-dir
+                             (merge-pathnames (uiop:pathname-parent-directory-pathname
+                                               (enough-namestring from-dir base-dir))
+                                              to))))
+                     (t
+                      (ensure-directories-exist to)
+                      (uiop:copy-file from to)))))
+      (rec from to))))
+
+;;; ------------------------------------------------------------------
+;;; Virtual File System Hooks
+;;; ------------------------------------------------------------------
+;;;
+;;; These hook lists allow extensions (like lem-tramp) to intercept file
+;;; operations for non-local paths (e.g. /ssh:host:/path or /sudo::/path).
+;;;
+;;; Each hook is a list of functions.  When the core needs to operate on a
+;;; file, it walks the corresponding list; each function checks whether it
+;;; can handle the given path and either returns a result (short-circuiting
+;;; the chain) or returns nil (passing to the next handler).  If no handler
+;;; matches, the operation falls through to the local filesystem.
+;;;
+;;; Handler contracts:
+;;;   file-open          → (values stream closer) or nil
+;;;   probe-file         → truename or nil
+;;;   directory-exists-p → directory path or nil
+;;;   directory-files    → list of pathnames or nil
+;;;   file-metadata      → integer (size / mtime / write-date) or nil
+;;;   expand-file-name   → expanded path string or nil
+;;;
+;;; Example consumer: extensions/tramp/tramp.lisp
+
+(defparameter *virtual-file-open* nil)
+
+(defparameter *virtual-probe-file-functions* nil
+  "A list of functions for virtual probe-file.
+Each function receives (pathspec &optional base-dir) and should return
+a pathname if the file exists, or nil to pass to the next handler.")
+
+(defparameter *virtual-expand-file-name-functions* nil
+  "A list of functions for virtual expand-file-name.
+Each function receives (filename &optional directory) and should return
+an expanded filename string, or nil to pass to the next handler.")
+
+(defparameter *virtual-directory-files-functions* nil
+  "A list of functions for virtual directory-files.
+Each function receives (pathspec) and should return a list of pathnames,
+or nil to pass to the next handler.")
+
+(defparameter *virtual-file-metadata-functions* nil
+  "A list of functions for virtual file metadata (size, mtime).
+Each function receives (pathname op) where op is :size, :mtime, or :write-date,
+and should return the value, or nil to pass to the next handler.")
+
+(defparameter *virtual-directory-exists-p-functions* nil
+  "A list of functions for virtual directory-exists-p.
+Each function receives (directory) and should return the directory if it exists,
+or nil to pass to the next handler.")
+
+(defun %call-virtual-handlers (handlers args fallback-fn)
+  "Try each function in HANDLERS with ARGS. Return the first non-nil result.
+If no handler matches, call FALLBACK-FN."
+  (or (loop :for f :in handlers
+            :for result := (apply f args)
+            :when result :do (return result))
+      (funcall fallback-fn)))
+
+(defun virtual-directory-exists-p (directory)
+  "Check if a directory exists, using virtual filesystem hooks if applicable."
+  (%call-virtual-handlers *virtual-directory-exists-p-functions*
+      (list directory)
+    (lambda () (uiop:directory-exists-p directory))))
+
+(defun open-virtual-file (filename &key external-format direction element-type)
+  (apply #'values
+         (or (loop :for f :in *virtual-file-open*
+                   :for result := (funcall f filename
+                                           :external-format external-format
+                                           :element-type element-type
+                                           :direction direction)
+                   :when result
+                   :do (return result))
+             (list (apply #'open filename
+                          `(:direction ,direction
+                            ,@(when (eql direction :output)
+                                '(:if-exists :supersede
+                                  :if-does-not-exist :create))
+                            ,@(when external-format
+                                `(:external-format ,external-format))
+                            :element-type ,@(if element-type (list element-type) '(character))))))))
+
+(defmacro with-open-virtual-file ((stream filespec &rest options)
+                                  &body body)
+  (let ((close/ (gensym)))
+    `(multiple-value-bind (,stream ,close/)
+         (open-virtual-file ,filespec ,@options)
+       (unwind-protect
+            (multiple-value-prog1
+                (progn ,@body))
+         (when ,stream
+           (funcall (or ,close/ #'close) ,stream))))))

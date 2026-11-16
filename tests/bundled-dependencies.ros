@@ -1,0 +1,38 @@
+#!/bin/sh
+#|-*- mode:lisp -*-|#
+#|
+exec ros -Q -- "$0" "$@"
+|#
+(ros:ensure-asdf)
+(sb-ext:disable-debugger)
+(defparameter *repository*
+  (uiop:pathname-parent-directory-pathname
+   (uiop:pathname-directory-pathname *load-truename*)))
+(setf (uiop:getenv "XDG_CACHE_HOME")
+      (string-trim '(#\Newline)
+                   (uiop:run-program '("mktemp" "-d" "/tmp/cl-lsp-plan.XXXXXX") :output :string)))
+(asdf:initialize-output-translations
+ `(:output-translations (t (,(uiop:ensure-directory-pathname (uiop:getenv "XDG_CACHE_HOME")) :implementation))
+   :ignore-inherited-configuration))
+(load (merge-pathnames "vendor/setup.lisp" *repository*))
+(defun main (&rest args)
+  (declare (ignore args))
+  (let ((systems (make-hash-table :test 'equal)))
+    (dolist (name '("cl-lsp" "swank" "micros"))
+      (dolist (action (asdf/plan:plan-actions
+                       (asdf:make-plan 'asdf:sequential-plan 'asdf:load-op name)))
+        (when (typep (cdr action) 'asdf:source-file)
+          (assert (probe-file (asdf:component-pathname (cdr action))) ()
+                  "Missing runtime source: ~A" (asdf:component-pathname (cdr action))))
+        (let* ((system (asdf:component-system (cdr action)))
+               (file (asdf:system-source-file system)))
+          (when (and file
+                     (not (and (uiop:string-prefix-p "sb-" (asdf:component-name system))
+                               (equal (last (pathname-directory file) 2) '("sbcl" "contrib")))))
+            (assert (uiop:subpathp (truename file) (truename *repository*))
+                    () "Dependency escaped bundled sources: ~A" file)
+            (setf (gethash (asdf:component-name system) systems) t)))))
+    (dolist (name '("lem" "lem/core" "lem-language-server" "deploy" "lem-extension-manager" "dexador" "cl+ssl" "cl-mustache"))
+      (assert (not (asdf:find-system name nil)) () "Unexpected external system: ~A" name))
+    (format t "Bundled dependency plans passed (~D source systems); no external Lem or deploy.~%"
+            (hash-table-count systems))))

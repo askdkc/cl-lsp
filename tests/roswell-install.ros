@@ -21,7 +21,7 @@ exec ros -Q -- "$0" "$@"
          (progn
            (setf (uiop:getenv "XDG_CACHE_HOME") (namestring (merge-pathnames "cache/" root)))
            (asdf:clear-output-translations)
-           (dolist (file '("cl-lsp.asd" "main.lisp" "scripts/installer.lisp" "roswell/cl-lsp.ros"))
+           (dolist (file '("cl-lsp.asd" "cl-lsp-bootstrap.asd" "project.lisp" "main.lisp" "scripts/installer.lisp" "roswell/cl-lsp.ros"))
              (uiop:copy-file (merge-pathnames file *repository*)
                              (ensure-directories-exist (merge-pathnames file project))))
            ;; Exercise the real Roswell installation routine, replacing only
@@ -29,8 +29,7 @@ exec ros -Q -- "$0" "$@"
            (with-open-file (out (merge-pathnames "scripts/installer.lisp" project)
                                 :direction :output :if-exists :append)
              (write-string "
-(defun install (prefix &key tls-only)
-  (declare (ignore tls-only))
+(defun install (prefix)
   (when (equal (uiop:getenv \"CL_LSP_TEST_FAIL\") \"1\") (error \"Simulated dependency failure\"))
   (ensure-directories-exist prefix)
   (let ((launcher (merge-pathnames \"cl-lsp\" prefix)))
@@ -48,8 +47,20 @@ printf 'ARG:%s
                     (setf (symbol-function checkout-symbol) (lambda () root))
                     (asdf:initialize-source-registry
                      `(:source-registry (:directory ,project) :inherit-configuration))
-                    (asdf:load-asd (merge-pathnames "cl-lsp.asd" project))
-                    (uiop:symbol-call :roswell.install :install-system-script "cl-lsp")
+                    ;; Match Roswell's project.lisp selector exactly.
+                    (with-open-file (in (merge-pathnames "project.lisp" project))
+                      (assert (equal "cl-lsp-bootstrap"
+                                     (second (assoc "asd" (second (second (first (nth 1 (read in)))))
+                                                    :test #'equal)))))
+                    ;; Simulate the old globally registered system. Resolving it
+                    ;; would load lem.asd and fail before the build hook.
+                    (let ((poison (merge-pathnames "legacy/cl-lsp.asd" root)))
+                      (ensure-directories-exist poison)
+                      (with-open-file (out poison :direction :output)
+                        (write-string "(error \"Legacy Lem must not be loaded\")" out))
+                      (push (uiop:pathname-directory-pathname poison) asdf:*central-registry*))
+                    (asdf:load-asd (merge-pathnames "cl-lsp-bootstrap.asd" project))
+                    (uiop:symbol-call :roswell.install :install-system-script "cl-lsp-bootstrap")
                     (let* ((pointer (merge-pathnames "bin/cl-lsp-runtime.sexp" root))
                            (before (uiop:read-file-string pointer))
                            (launcher (namestring (merge-pathnames "bin/cl-lsp" root))))
@@ -58,16 +69,17 @@ printf 'ARG:%s
                         (assert (equal output (format nil "ARG:--stdio~%ARG:a b~%")) () "Unexpected launcher output: ~S" output))
                       (setf (uiop:getenv "CL_LSP_TEST_FAIL") "1")
                       (assert (handler-case
-                                  (progn (uiop:symbol-call :roswell.install :install-system-script "cl-lsp") nil)
+                                  (progn (uiop:symbol-call :roswell.install :install-system-script "cl-lsp-bootstrap") nil)
                                 (error () t)))
                       (assert (equal before (uiop:read-file-string pointer)))
                       (setf (uiop:getenv "CL_LSP_TEST_FAIL") "")
-                      (uiop:symbol-call :roswell.install :install-system-script "cl-lsp")
+                      (uiop:symbol-call :roswell.install :install-system-script "cl-lsp-bootstrap")
                       (assert (not (equal before (uiop:read-file-string pointer))))
+                      (setf asdf:*central-registry* nil)
                       ;; Outside Roswell's installation phase this must remain
                       ;; the real server system, not the bootstrap definition.
                       (asdf:load-asd (merge-pathnames "cl-lsp.asd" project))
-                      (assert (equal '("lem-language-server/cli")
+                      (assert (equal '("cl-lsp/cli")
                                      (asdf:system-depends-on (asdf:find-system "cl-lsp"))))
                       (format t "Roswell build hook, copied launcher, argument forwarding, reinstall and failed-install preservation passed.~%")))
                (setf (symbol-function checkout-symbol) original))))
